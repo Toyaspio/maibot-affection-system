@@ -409,6 +409,57 @@ class UserManagementSection(PluginConfigBase):
     )
 
 
+class ImpressionSection(PluginConfigBase):
+    """独立印象模块。默认关闭；不改变已有好感度数据与规则。"""
+
+    __ui_label__ = "用户印象"
+    __ui_icon__ = "message-circle"
+    __ui_order__ = 7
+
+    enabled: bool = Field(default=False, description="启用主动本人查询的印象功能（默认关闭）")
+    generation_enabled: bool = Field(default=True, description="允许后台生成；关闭后仅展示缓存")
+    min_update_interval_hours: int = Field(default=24, ge=24, le=8760, description="同一QQ成功更新最小间隔（小时），不能低于24")
+    min_new_valid_messages: int = Field(default=15, ge=10, le=30, description="最少新增有效本人消息数")
+    min_initial_valid_messages: int = Field(default=1, ge=1, le=30, description="首次无印象时的有效本人消息门槛；历史群聊也计入")
+    initial_min_message_chars: int = Field(default=2, ge=2, le=6, description="首次有效发言最少字词字符数；后续仍至少6字")
+    initial_no_change_check_cooldown_minutes: int = Field(default=1, ge=1, le=30, description="首次证据不足后再次主动查询的扫描间隔（分钟）；不绕过失败/成功冷却")
+    newcomer_intro_enabled: bool = Field(default=True, description="确认记忆、画像和有效历史均不可用后展示自然回应；扫描中仅展示整理状态")
+    newcomer_intro_text: str = Field(
+        default="你来问这个，我可有认真听哦。想说什么就说嘛，不用特意表现，照着自己的节奏聊就好。",
+        min_length=1, max_length=240, description="资料不足时可调整角色语气的自然回应；仅作展示，不写入长期印象")
+    history_scope: str = Field(default="current_chat", pattern="^(current_chat|all_groups)$", description="历史取证范围；all_groups仅汇总同一QQ的群聊，私聊独立")
+    initial_history_days: int = Field(default=30, ge=1, le=90, description="首次印象最多回看历史天数")
+    max_history_groups: int = Field(default=50, ge=1, le=100, description="跨群检索最多群数，当前群优先")
+    max_total_history_messages: int = Field(default=3000, ge=500, le=10000, description="一次跨群历史读取总消息预算，不等于送入模型的消息数")
+    native_memory_enabled: bool = Field(default=False, description="读取同QQ原生memory_points；global_internal时清洗后仅内部参考，否则需本人群聊原话核实")
+    native_profile_enabled: bool = Field(default=False, description="只读参考A_Memorix原生画像缓存；不会写原生库或触发画像重建")
+    native_profile_scope: str = Field(default="verified_groups", pattern="^(verified_groups|global_internal)$", description="global_internal需管理员明确允许全局画像仅作内部参考；默认不读取全局画像")
+    native_profile_cache_path: str = Field(default="", max_length=600, description="已核实的原生metadata.db绝对路径；空值关闭兼容读取，不猜测路径")
+    native_profile_max_chars: int = Field(default=1200, ge=200, le=2000, description="送入模型的原生画像内部参考最大字符数")
+    initial_fallback_message_limit: int = Field(default=30, ge=1, le=30, description="首次无长期记忆和画像时取最近最多30条本人有效记录；不足则用实际条数")
+    max_native_memory_points: int = Field(default=5, ge=1, le=10, description="最多参考的原生记忆要点数")
+    max_memory_chars: int = Field(default=160, ge=40, le=300, description="每条原生记忆最大字符数")
+    max_evidence_messages: int = Field(default=40, ge=30, le=60, description="单次送入模型的最多消息数")
+    max_chars_per_message: int = Field(default=160, ge=40, le=300, description="每条证据最多字符")
+    max_query_scan_messages: int = Field(default=500, ge=40, le=1000, description="单次当前会话历史扫描上限")
+    initial_lookback_days: int = Field(default=7, ge=1, le=30, description="历史回看天数上限")
+    late_arrival_hours: int = Field(default=48, ge=1, le=168, description="游标重叠扫描窗口，兼容延迟入库及同时间戳")
+    no_change_check_cooldown_minutes: int = Field(default=30, ge=1, le=1440, description="证据不足后再次扫描间隔")
+    failure_retry_minutes: int = Field(default=60, ge=0, le=1440, description="失败或中断后的重试冷却；0允许下一次主动查询重试，无自动重试")
+    daily_global_llm_attempts: int = Field(default=20, ge=0, le=1000, description="全局每日模型尝试上限，失败也计次；0禁止生成")
+    budget_utc_offset_hours: int = Field(default=8, ge=-12, le=14, description="每日预算时区UTC偏移，默认北京时间")
+    max_global_concurrency: int = Field(default=1, ge=1, le=4, description="印象任务并发上限，修改后重载插件生效")
+    max_pending_tasks: int = Field(default=20, ge=1, le=100, description="全局在途及等待任务总上限，超出直接沿用缓存")
+    model_task: str = Field(default="utils", min_length=1, max_length=80, description="宿主模型任务名")
+    request_timeout_seconds: int = Field(default=25, ge=1, le=120, description="历史查询和模型请求各自超时秒数")
+    max_response_tokens: int = Field(default=900, ge=256, le=1500, description="每次最大输出Token；无自动重试")
+    temperature: float = Field(default=0.6, ge=0, le=1, description="模型采样温度")
+    output_min_hanzi: int = Field(default=1, ge=1, le=90, description="展示正文验收下限；生成目标仍约100字")
+    output_max_hanzi: int = Field(default=200, ge=120, le=200, description="展示正文验收上限；生成目标仍约100字")
+    long_summary_min_hanzi: int = Field(default=1, ge=1, le=100, description="长期摘要最少汉字数；证据少时允许简短，最多200汉字")
+    max_saved_versions: int = Field(default=5, ge=1, le=20, description="额外保存的旧印象版本数量")
+
+
 class AffectionConfig(PluginConfigBase):
     """好感度系统插件总配置。
 
@@ -422,6 +473,7 @@ class AffectionConfig(PluginConfigBase):
     user_management: UserManagementSection = Field(default_factory=UserManagementSection)
     call_behavior: CallBehaviorSection = Field(default_factory=CallBehaviorSection)
     evaluation: EvaluationSection = Field(default_factory=EvaluationSection)
+    impression: ImpressionSection = Field(default_factory=ImpressionSection)
 
 
 def create_config() -> AffectionConfig:

@@ -1,19 +1,19 @@
 {
   "manifest_version": 2,
   "id": "feyumy.affection-system",
-  "version": "1.2.0",
+  "version": "1.3.12",
   "name": "好感度系统",
-  "description": "为 MaiBot 角色扮演提供好感度追踪系统。记录不同用户的好感度（-20~100），分为不喜/正常/熟悉/亲近/亲密/思慕六个等级。通过插件内 LLM 自动评价与 Planner 工具调用相结合：自动评价基于对话上下文、角色性格与当前关系等级综合判断互动是否改变好感度，不依赖关键词行为分类；并提供对应的回应风格提示。数据持久化存储，支持 WebUI 可视化配置。",
+  "description": "基于 Feyumy 好感度系统的增强版：保留好感度追踪、自动评价及角色回应风格，新增本人主动查询的用户印象、长期摘要、有界历史取证与模型调用预算。",
   "author": {
     "name": "Feyumy",
     "url": "https://github.com/feiyunming"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/feiyunming/maibot-affection-system",
-    "homepage": "https://github.com/feiyunming/maibot-affection-system",
-    "documentation": "https://github.com/feiyunming/maibot-affection-system/blob/main/README.md",
-    "issues": "https://github.com/feiyunming/maibot-affection-system/issues"
+    "repository": "https://github.com/Toyaspio/maibot-affection-system",
+    "homepage": "https://github.com/Toyaspio/maibot-affection-system",
+    "documentation": "https://github.com/Toyaspio/maibot-affection-system/blob/main/README.md",
+    "issues": "https://github.com/Toyaspio/maibot-affection-system/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -35,7 +35,12 @@
     "send.text",
     "chat.get_all_streams",
     "message.get_recent",
+    "message.get_by_time_in_chat",
+    "chat.get_group_streams",
+    "person.get_id",
+    "person.get_value",
     "person.get_id_by_name",
+    "database.get",
     "llm.generate"
   ],
   "i18n": {

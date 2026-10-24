@@ -1,150 +1,81 @@
-# 好感度系统插件（affection-system）
+# MaiBot 好感度与用户印象增强版
 
-为 MaiBot 角色扮演提供好感度追踪与长期记忆的第三方插件。记录不同用户与角色的好感度，基于对话上下文与角色关系综合评价互动质量，动态调整好感度，并让角色按对应好感度等级自然回应。
+基于 [Feyumy / feiyunming 的 maibot-affection-system](https://github.com/feiyunming/maibot-affection-system) 开发，由 [Toyaspio](https://github.com/Toyaspio) 维护本 Fork。保留原有好感度系统，增加按本人主动查询更新的用户印象与长期摘要。
 
-- 插件 ID：`feyumy.affection-system`
-- 许可证：MIT
+- 当前版本：**1.3.12**。
+- 许可证：**MIT**，保留原作者版权声明，见 [LICENSE](LICENSE)。
+- 插件 ID：`feyumy.affection-system`。为兼容原有数据暂时保留；与原版二选一安装，不能同时加载两个副本。
+- 原版作者与本 Fork 维护者分别负责各自版本；本仓库不是原作者官方发布。
 
-## 功能特性
+## 功能
 
-- 记录每位用户与角色的好感度值（范围 `-20 ~ 100`）。
-- 六级好感度划分：**不喜 / 正常 / 熟悉 / 亲近 / 亲密 / 思慕**。
-- **插件内 LLM 自动评价**：用户消息到达后，插件直接调用 LLM，基于最近对话上下文、角色性格与当前关系等级综合判断本次互动是否值得改变好感度（不依赖关键词行为分类，也不需要 Planner 主动调用工具）。
-- **关系感知的数值阻尼**：高好感度时负面扣分按比例缩小（亲密关系经得起小摩擦）；同一天连续负面调整超过上限后扣分递减（防止好感度断崖下跌）。
-- 提供 `query_affection` / `adjust_affection` 工具供 Planner 直接调用（无需 `tool_search` 发现），用于重大事件与自动评价遗漏的场景。
-- 不同好感度等级对应不同的回应风格提示，注入给 LLM 让角色言行更贴合关系亲疏。
-- 好感度数据持久化存储于插件数据目录（`data/plugins/<插件 ID>/affection_data.json`）。
-- 支持 WebUI 可视化配置与管理：
-  - 「好感度管理」配置节以可编辑表格展示各用户好感度，可直接查看、修改，保存后立即生效。
-  - 锁定条目后，LLM 将不再自动调整该用户好感度。
-  - 运行时变化会自动同步回配置表，保证 WebUI 展示最新数值。
-- 提供 `/affection` 命令供用户查询自己的好感度。
+- 原有好感度：数值范围 -20～100，六档关系等级，按上下文自动评价互动，并为角色提供回应风格参考。
+- 用户印象：本人通过 `/affection`、明确自然语言自查或真实 @机器人查询，返回好感度和印象缓存；符合条件时后台更新。
+- 长期摘要：融合旧摘要与新的本人发言，允许根据新证据修正认识；独立保存展示正文和长期摘要。
+- 身份校验：按真实 QQ、会话和消息 ID 认证查询；昵称、工具参数、其他用户的 @ 不用于绑定画像。
+- 成本控制：新增消息门槛、成功/失败冷却、全局预算、并发防重、失败保留旧印象。
+- 可选内部参考：SDK 旧记忆要点及原生画像只读快照。默认关闭，需要管理员明确启用并确认资料使用范围。
 
-## 安装
+证据少时可以自然、可爱地表达当下感受，不强制强调“刚认识”；不应据单次发言编造稳定性格、亲密程度或共同经历。模型输出仍可能不准确。
 
-1. 将整个 `affection-system` 目录放入 MaiBot 的 `plugins/` 目录（注意不要修改主程序代码）。
-2. 在 MaiBot 插件管理页中启用「好感度系统」，或使用 `/pm plugin load affection-system`。
-3. 首次加载后，Runner 会根据 `config_model` 自动生成 `config.toml`，无需手动创建。
+## 安装和升级
 
-若从旧版本（插件 ID 为 `Feyumy.affection-system`）升级，插件首次加载时会自动把旧数据目录中的 `affection_data.json` 迁移到新目录，历史好感度不会丢失。
+1. 将本仓库放入 MaiBot 的插件目录，保持 `plugin.py`、`config.py` 和 `_manifest.json` 位于插件根目录。
+2. 在插件管理器中加载插件。配置由 Runner 根据配置模型生成，使用 WebUI 调整；不要把示例覆盖到已有整份配置上。
+3. 好感度功能沿用原版设置，**用户印象默认关闭**。需要使用时在 `[impression]` 中启用。
 
-## 配置项
+```toml
+[impression]
+enabled = true
+generation_enabled = true
+```
 
-配置通过 WebUI 插件配置页或 `plugins/affection-system/config.toml` 修改，保存后立即生效。
+模型任务默认 `utils`，需在宿主中正确配置。详细参数、数据与常见问题见 [印象使用说明](IMPRESSION_DELIVERY.md)。
 
-### `[plugin]` 插件基础设置
+升级前备份插件目录（含本地配置）及 SDK 实际分配的插件数据目录。不要删除旧数据或同时安装原版和本 Fork。替换源码后按当前宿主支持的方式重载；不支持可靠重载时，仅重启必要的 MaiBot 核心进程。不要为更新本插件重启 QQ/NapCat/Xvfb。
 
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `enabled` | 是否启用好感度系统 | `true` |
+## 查询和更新有什么区别
 
-### `[personality]` 角色性格
+**查询先读缓存，后台更新成功后，下次查询才会显示新内容。** 已发送的回复不会被修改，也不会自动补发。
 
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `character_name` | 角色名称，用于提示与展示 | `麦麦` |
-| `personality_type` | 性格类型：默认 / 傲娇 / 温柔 / 高冷 / 开朗 / 毒舌 | `默认` |
-| `character_personality_hint` | 角色性格简述（供自动评价参考），如「傲娇、贪财、口嫌体正直的巫女」 | 空 |
-| `affection_gain_multiplier` | 好感度变化倍率（>1 更快，<1 更慢） | `1.0` |
-| `affection_decay_enabled` | 是否启用好感度自然衰减 | `false` |
-| `affection_decay_days` | 超过多少天未互动开始衰减 | `30` |
-| `affection_decay_rate` | 每次衰减的好感度点数 | `0.5` |
-
-### `[affection_rule]` 变化规则
-
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `initial_affection` | 新用户首次互动时的初始好感度 | `10.0` |
-| `positive_interaction_min/max` | 正面互动增加范围 | `0.5 ~ 3.0` |
-| `negative_interaction_min/max` | 负面互动减少范围 | `-3.0 ~ -0.5` |
-| `neutral_interaction_value` | 中性互动（普通聊天）增值 | `0.1` |
-| `special_interaction_value` | 特殊互动（送礼、表白等）增值 | `5.0` |
-| `cool_down_seconds` | 同一位用户两次变更的最小间隔（秒） | `60` |
-| `daily_limit` | 每位用户每天最多变更次数 | `20` |
-| `high_affection_negative_damper_threshold` | 高位阻尼阈值：好感度高于此值时负面扣分缩小 | `40.0` |
-| `high_affection_negative_damper_multiplier` | 高位阻尼系数（扣分乘以该系数） | `0.5` |
-| `negative_spiral_limit` | 同一天连续负面调整达到该次数后扣分递减 | `3` |
-| `negative_spiral_decay` | 负面螺旋阻尼系数（每次扣分乘以该系数） | `0.5` |
-
-> 提示：`adjust_affection` 工具支持可选参数 `change_value`，Planner 可按互动的重要程度给出精确变化值（如轻微调侃 `-1`、诚心道歉 `+2`、重大帮助 `+8`）；不填写时按各类型的默认范围自动取值。所有变化都会经过角色性格倍率与关系阻尼。
-
-### `[response]` 回应风格
-
-不同好感度等级下注入给 LLM 的回应风格提示，共 6 项：`dislike_response_hint`、`normal_response_hint`、`familiar_response_hint`、`close_response_hint`、`intimate_response_hint`、`adore_response_hint`。
-
-### `[user_management]` 好感度管理
-
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `sync_to_config` | 运行时好感度变化是否自动同步到下方管理表 | `true` |
-| `managed_users` | 好感度管理表（WebUI 中可编辑），支持 `user_id`、`affection`、`locked`、`note` | 空 |
-
-### `[call_behavior]` 调用行为
-
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `inject_affection_hint` | 是否在回复前自动注入好感度提示 | `true` |
-| `inject_probability` | 好感度提示注入概率（0~1） | `1.0` |
-| `encourage_tool_calls` | 是否在提示末尾附上「可调用 adjust_affection」提醒 | `false` |
-
-### `[evaluation]` 自动评价
-
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `enabled` | 是否启用插件内 LLM 自动评价 | `true` |
-| `model_task` | 评价使用的模型任务名（`model_config.toml` 中的 `[model_task_config.*]`） | `utils` |
-| `max_context_messages` | 评价时提供的最近对话条数 | `8` |
-| `max_response_tokens` | 评价请求最大输出 token | `1024` |
-| `temperature` | 评价温度（越低越稳定） | `0.2` |
-
-## 命令
-
-| 命令 | 说明 |
+| 项目 | 默认行为 |
 | --- | --- |
-| `/affection` | 查询当前用户与角色的好感度及等级 |
+| 首次生成 | 有可用且已核验的内部参考，或至少 1 条有效本人发言（最少 2 个字词字符） |
+| 后续生成 | 至少 15 条新增有效本人发言，且距离上次成功至少 24 小时 |
+| 每日预算 | 最多 20 次印象模型尝试，失败也计次，按北京时间持久化 |
+| 失败重试冷却 | 60 分钟，可配置；无自动循环重试 |
+| 展示正文/长期摘要 | 各 1～200 汉字；正文目标约 100 字，证据少时可以简短 |
+| 历史范围 | 默认当前会话；跨群汇总需显式配置，私聊独立 |
 
-## 权限 / 能力说明
+命令、重复刷屏、纯应声、无效内容及他人消息不计入有效新增发言。普通 `query_affection` 模型工具调用不会触发印象生成。
 
-插件仅在需要时向 Host 申请以下能力：
+印象预算只约束印象模块；原有好感度自动评价和宿主普通聊天的模型费用另计。20 次是请求次数上限，不是精确 Token 费用封顶。
 
-- `send.text`：发送查询结果等文本消息。
-- `chat.get_all_streams`：根据会话反查发言者身份（私聊场景兜底）。该能力会遍历所有平台的全部聊天流，权限范围较宽，仅用于按 session_id 反查 user_id、不会枚举或泄露流列表。
-- `message.get_recent`：反查会话最近消息（解析当前发言人、组装自动评价上下文）。
-- `person.get_id_by_name`：把昵称解析为稳定的用户 ID，避免同一人被拆成两条记录。
-- `llm.generate`：插件内调用 LLM 对互动做上下文综合评价。
+## 数据和隐私
 
-插件运行在独立 Runner 子进程中，不导入 `src.*`，所有能力均通过 `self.ctx` 代理调用。
+SDK 分配的插件数据目录中：`affection_data.json` 保存原好感度，`impression_data.json` 保存印象正文、长期摘要、旧版本、游标、状态和预算。备份应同时包含两者。源码和配置模型不会附带任何用户的运行数据。
 
-## 常见问题
+本人发言及启用后的可选内部参考会通过宿主模型任务发送给其配置的模型服务商。启用前应确认群内资料使用规则及模型服务的数据处理方式。原生画像过滤和输出检查只能降低泄露风险，不能保证模型输出绝对安全或准确。
 
-### 聊天里出现 `<function_calls>...` 之类的工具调用原文
+本插件不回写或重建原生画像，不把印象摘要自动写回原生记忆系统。
 
-这是旧版本插件把「请调用 adjust_affection 工具」的引导同时注入给了 replyer 模型（replyer 没有工具定义），模型便以 `<function_calls>` 文本形式模仿调用并原样发出。`1.0.3` 起回复模型只会收到好感度态度提示，不再收到工具调用引导；`1.2.0` 起好感度工具直接可见，注入提示也不再包含工具调用引导。
+## 兼容性和验证
 
-### 好感度一直没有变化
+在 MaiBot 插件 SDK **2.10.0**、Python **3.13.16** 的环境验证过；清单中的版本范围不等于逐版本测试承诺。其他宿主版本请先在测试环境验证。
 
-按顺序检查：
+1.3.12 的 **120 项离线模拟测试**和实际 SDK smoke 检查通过。离线测试使用虚构身份和消息，不连接 QQ、不调用真实模型。SDK smoke 使用真实 SDK 与模拟 RPC，不能代替宿主实际收发和模型输出验收。
 
-1. 是否在冷却期（默认 60 秒）或今日次数已达上限。
-2. 该用户是否在「好感度管理」表中被 `locked` 锁定。
-3. `evaluation.enabled` 是否开启（自动评价）；`call_behavior.inject_affection_hint` 是否开启（回应风格注入）。
-4. 评价模型任务名（`evaluation.model_task`）是否有效；日志中搜索 `自动评价` 或 `好感度` 可看到具体原因。
+```bash
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
 
-### 为什么有时互动明显却不变好感度
+在已有正确 SDK 和运行依赖的测试环境，还可运行 `python tools/sdk_smoke.py`。`tools/verify_baseline.py` 用于和自行保存的原版 `plugin.py` 比较方法 AST。
 
-自动评价与 Planner 工具都会判断「本次互动是否有实质意义」：琐碎闲聊、单句问候、重复的打闹通常不改变好感度；同时冷却期（60 秒）与每日上限会限制变更频率。若某个互动确实重要（表白、送礼、重大帮助等），Planner 可主动调用 `adjust_affection` 记录。
+## 贡献和反馈
 
-### 数据保存在哪里
+欢迎通过 [本 Fork 的 Pull requests](https://github.com/Toyaspio/maibot-affection-system/pulls) 提交改进。若仓库已开启 Issues，也可在那里反馈问题；当前 Fork 创建时 Issues 默认关闭。反馈时请注明 MaiBot、SDK、插件版本及脱敏错误类别。不要上传密钥、完整配置、真实聊天、QQ 画像或用户数据文件。
 
-好感度数据保存在 `data/plugins/<插件 ID>/affection_data.json`（默认 ID 为 `feyumy.affection-system`）。手动备份插件数据时复制该文件即可。
+本 Fork 部分改动及文档借助 AI 编程助手完成，验证范围以测试说明为准。提交贡献时请说明具体行为变化、验证方式和已知限制；通用修复如需反馈上游，应拆分成独立、便于审查的改动。
 
-### 如何更新插件
-
-用 Git 管理插件目录，服务器上 `git pull` 后热重载即可（WebUI 插件管理页或 `/pm plugin reload affection-system`），无需重启 MaiBot。注意插件自身 `config.toml` 不入库，更新时不会被覆盖。
-
-## 开发与提交
-
-- 入口文件 `plugin.py`，工厂函数 `create_plugin()`。
-- 插件仅修改 `plugins/affection-system/` 内文件，不改动主程序。
-- 插件目录内的 `.gitignore` 已忽略 `/config.toml`、`config_back/`、`__pycache__/` 等本地文件。
-- 提交前请阅读 [MaiBot 插件仓库贡献指南](https://github.com/Mai-with-u/plugin-repo/blob/main/CONTRIBUTING.md)。
+版本变化见 [CHANGELOG.md](CHANGELOG.md)。本 Fork 保留原项目历史和 MIT 许可证；感谢原作者提供好感度系统基础。

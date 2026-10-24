@@ -43,6 +43,8 @@ from maibot_sdk import Command, HookHandler, MaiBotPlugin, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .config import AffectionConfig
+from .impression_manager import ImpressionManager
+from .impression_messages import QueryRegistry, own_text, is_self_query, self_query_message_text
 
 # ════════════════════════════════════════════════════════════════
 # 好感度等级定义 (下界含, 上界不含, 等级名称, 等级描述)
@@ -141,6 +143,17 @@ class AffectionPlugin(MaiBotPlugin):
         # 由 chat.receive.after_process 调度，任务内调用 LLM 对互动做上下文评价，
         # 不阻塞消息接收链路；on_unload 时统一取消。
         self._evaluation_tasks: dict[str, asyncio.Task] = {}
+        # 精确好感度问询索引：仅记录当前真实消息 ID，对查询失败或身份未知不猜数值。
+        # key=(session_id, msg_id), value=是否明确在询问当前发言人自身的好感度。
+        self._affection_numeric_requests: dict[tuple[str, str], bool] = {}
+        # 只用于工具/身份核实失败时：轮换不同表达策略，避免固定台词反复出现。
+        self._affection_fallback_strategies: list[str] = []
+        self._last_affection_fallback_strategy: str = ""
+        self._impression_manager: ImpressionManager | None = None
+        self._impression_queries = QueryRegistry()
+        self._impression_bot_ids: set[str] = set()
+        self._impression_bot_lookup_at = 0.0
+        self._impression_bot_lookup_lock = asyncio.Lock()
 
     # ════════════════════════════════════════════════════════════════
     # 生命周期方法
@@ -162,6 +175,16 @@ class AffectionPlugin(MaiBotPlugin):
         await self._apply_decay_check()
         # 将运行时数据同步到 config.toml，让 WebUI 管理表展示最新好感度
         await self._sync_runtime_to_config()
+        # Independent subsystem: a failure must never prevent affection startup.
+        try:
+            self._impression_manager = ImpressionManager(
+                self.ctx, Path(data_dir) / "impression_data.json", self._impression_config)
+            await self._impression_manager.load()
+            if self._impression_config() and self._impression_config().enabled:
+                await self._refresh_impression_bot_ids()
+        except Exception as exc:
+            self._impression_manager = None
+            self.ctx.logger.warning("印象模块初始化已降级: %s", type(exc).__name__)
         self.ctx.logger.info(
             "好感度系统插件已加载 (角色: %s, 已记录 %d 位用户的好感度)",
             self.config.personality.character_name if self.config else "未知",
@@ -170,6 +193,11 @@ class AffectionPlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         """插件卸载时取消后台任务、写入磁盘，并将运行时数据同步回配置。"""
+        if self._impression_manager is not None:
+            try:
+                await self._impression_manager.close()
+            except Exception as exc:
+                self.ctx.logger.warning("印象模块卸载已降级: %s", type(exc).__name__)
         for session_id, task in list(self._evaluation_tasks.items()):
             task.cancel()
             self._evaluation_tasks.pop(session_id, None)
@@ -601,6 +629,14 @@ class AffectionPlugin(MaiBotPlugin):
         # 2. 显式传入的纯数字参数直接视为 QQ 号（可能是注入绑定值或 LLM 填的）
         requested = str(requested_user_id or "").strip()
         if requested.isdigit():
+            sid = str(stream_id or kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+            speaker = self._lookup_message_speaker(sid, requested) if sid else ""
+            if speaker:
+                self.ctx.logger.warning(
+                    "好感度参数为消息ID，已转换为QQ: %s -> %s",
+                    requested, speaker
+                )
+                return speaker
             return requested
 
         # 3. 尝试把昵称解析为人物 ID（人物 ID 通常为纯数字，即平台 user_id）
@@ -1022,7 +1058,7 @@ class AffectionPlugin(MaiBotPlugin):
             return {"success": False, "error": "无法确定互动对象的用户标识"}
 
         # 记录「会话 ↔ 用户」映射，供注入 Hook 反查使用
-        self._record_session_user(stream_id, resolved_user_id)
+        # 查询对象不一定是当前发言者，禁止污染会话身份缓存。
 
         # 获取好感度数据
         record = self._get_user_record(resolved_user_id)
@@ -1254,7 +1290,7 @@ class AffectionPlugin(MaiBotPlugin):
     @Command(
         "check_affection",
         description="查询当前用户与角色的好感度",
-        pattern=r"^/affection$",
+        pattern=r"^(?:/affection|.*(?:好感度查询|查询好感度))\s*$",
     )
     async def check_affection(
         self, stream_id: str = "", **kwargs: Any
@@ -1311,6 +1347,11 @@ class AffectionPlugin(MaiBotPlugin):
                 f"（最近一次变化: {change_time_str}）"
             )
 
+        # Only host command context + an exact authenticated receive-hook message.
+        mid = str(kwargs.get("message_id") or kwargs.get("msg_id") or "").strip()
+        if not mid and isinstance(kwargs.get("message"), dict):
+            mid = str(kwargs["message"].get("message_id") or "").strip()
+        message += self._self_query_impression(stream_id, mid, user_id)
         if stream_id:
             await self.ctx.send.text(message, stream_id)
 
@@ -1377,9 +1418,151 @@ class AffectionPlugin(MaiBotPlugin):
                 break
         dq.append((message_id, user_id))
 
+        # This registry is separate from the original identity/repair mechanisms.
+        try:
+            cfg = self._impression_config()
+            info = message.get("message_info") or {}
+            user = info.get("user_info") or {}
+            platform = user.get("platform") or info.get("platform") or message.get("platform")
+            if cfg and cfg.enabled and not message.get("is_notify") and (
+                str(platform).lower() == "qq"
+            ):
+                name = self.config.personality.character_name
+                raw = message.get("raw_message")
+                has_at = isinstance(raw, list) and any(isinstance(s, dict) and s.get("type") == "at" for s in raw)
+                if has_at and is_self_query(own_text(message), name):
+                    await self._refresh_impression_bot_ids()
+                text = self_query_message_text(message, name, self._impression_bot_ids)
+                if text:
+                    self._impression_queries.remember(
+                        session_id, message_id, user_id, text, name,
+                        str((info.get("group_info") or {}).get("group_id") or ""))
+        except Exception as exc:
+            self.ctx.logger.debug("印象查询认证已跳过: %s", type(exc).__name__)
+
         # 调度自动评价（后台任务，不阻塞消息接收链路）
         self._schedule_auto_evaluation(session_id, user_id, message)
         return {"action": "continue"}
+
+    def _impression_config(self):
+        if self.config is None or not self.config.plugin.enabled:
+            return None
+        return getattr(self.config, "impression", None)
+
+    async def _refresh_impression_bot_ids(self):
+        """Use the SDK's read-only confirmed-account model, never message/tool IDs."""
+        async with self._impression_bot_lookup_lock:
+            now = time.monotonic()
+            if self._impression_bot_lookup_at and now - self._impression_bot_lookup_at < 60:
+                return
+            self._impression_bot_lookup_at = now
+            try:
+                rows = await asyncio.wait_for(self.ctx.db.get(
+                    "BotPlatformAccount", filters={"platform": "qq", "disabled": False}, limit=20), timeout=0.8)
+                if isinstance(rows, dict):
+                    if rows.get("success") is False:
+                        raise ValueError("account lookup rejected")
+                    rows = rows.get("data", rows.get("result"))
+                if not isinstance(rows, list):
+                    raise ValueError("unsupported account response")
+                self._impression_bot_ids = {
+                    str(row.get("account_id") or "").strip() for row in rows
+                    if isinstance(row, dict) and row.get("platform") == "qq" and row.get("disabled") is False
+                    and str(row.get("account_id") or "").isascii() and str(row.get("account_id") or "").isdigit()}
+            except Exception as exc:
+                self._impression_bot_ids = set()
+                self.ctx.logger.debug("印象机器人身份读取已降级: %s", type(exc).__name__)
+
+    def _self_query_impression(self, stream_id: str, message_id: str, user_id: str) -> str:
+        """Never use tool arguments, a nickname or the latest speaker as authority."""
+        try:
+            cfg = self._impression_config()
+            manager = self._impression_manager
+            if not cfg or not cfg.enabled or manager is None:
+                return ""
+            if self._lookup_message_speaker(stream_id, message_id) != user_id:
+                return ""
+            if not self._impression_queries.claim(stream_id, message_id, user_id):
+                return ""
+            personality = self.config.personality
+            record = self._affection_data.get(user_id, {})
+            level = _get_affection_level_info(float(record.get("affection", 10.0)))
+            return manager.query(user_id, stream_id, {
+                "group_id": self._impression_queries.group_id(stream_id, message_id, user_id),
+                "character_name": personality.character_name,
+                "personality_hint": personality.character_personality_hint or personality.personality_type,
+                "relationship_level": level["level_name"],
+                "response_style": self._get_response_hint(level["value"]),
+            })
+        except Exception as exc:
+            self.ctx.logger.warning("印象查询已降级: %s", type(exc).__name__)
+            return ""
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="impression_explicit_self_query",
+        description="仅为精确绑定真实本人查询消息的reply附加缓存印象并检查后台刷新",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=2000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_self_query_impression(self, tool_calls=None, session_id="", **kwargs):
+        del kwargs
+        if not isinstance(tool_calls, list):
+            return {"action": "continue"}
+        modified = list(tool_calls)
+        changed = False
+        for index, call in enumerate(tool_calls):
+            func = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(func, dict) or func.get("name") != "reply":
+                continue
+            args = func.get("arguments")
+            if not isinstance(args, dict):
+                continue
+            mid = str(args.get("msg_id") or "").strip()
+            uid = self._lookup_message_speaker(session_id, mid) if mid else ""
+            if not uid:
+                continue
+            text = self._self_query_impression(session_id, mid, uid)
+            if not text:
+                continue
+            # Touch only this reply: other targets in the same batch receive no data.
+            new_args = dict(args)
+            new_args["reference_info"] = (
+                str(args.get("reference_info") or "")
+                + "\n【本轮本人主动查询的缓存印象】请在本轮好感度答复末尾原样附加以下正文，"
+                  "不扩写、不推断共同经历，也不要重复此说明：" + text)
+            modified[index] = {**call, "function": {**func, "arguments": new_args}}
+            changed = True
+        return ({"action": "continue", "modified_kwargs": {"tool_calls": modified}}
+                if changed else {"action": "continue"})
+
+    @HookHandler(
+        "maisaka.reply.before_post_process",
+        name="impression_append_to_explicit_self_reply",
+        description="兼容Item协议宿主，在精确本人查询的最终回复中确定性追加缓存印象",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=2000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def append_self_query_impression(
+        self, response="", session_id="", reply_message_id="", **kwargs
+    ):
+        # Current hosts expose output_items in Planner hooks. Append to the final
+        # string instead of guessing that schema or spending Replyer input tokens.
+        del kwargs
+        if not isinstance(response, str) or not response.strip():
+            return {"action": "continue"}
+        mid = str(reply_message_id or "").strip()
+        uid = self._lookup_message_speaker(session_id, mid) if mid else ""
+        if not uid:
+            return {"action": "continue"}
+        text = self._self_query_impression(session_id, mid, uid)
+        if not text:
+            return {"action": "continue"}
+        return {"action": "continue", "modified_kwargs": {"response": response + text}}
 
     @staticmethod
     def _extract_prompt_message_id(content: str) -> str:
@@ -1534,7 +1717,28 @@ class AffectionPlugin(MaiBotPlugin):
         # 工具 Schema，若提示里出现「请调用 adjust_affection 工具」之类的指令，
         # 模型会以 <function_calls> 文本形式模仿工具调用并原样发出，造成工具
         # 调用信息泄漏到聊天。因此这里只注入好感度态度提示，绝不包含工具调用引导。
-        user_id = await self._resolve_user_id_from_session(session_id)
+        # 从 reply 工具的 msg_id 定位真正的回复对象。
+        target_msg_id = ""
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function", {})
+            if not isinstance(func, dict) or func.get("name") != "reply":
+                continue
+            args = func.get("arguments", {})
+            if isinstance(args, dict):
+                target_msg_id = str(args.get("msg_id") or "").strip()
+            break
+
+        user_id = (
+            self._lookup_message_speaker(str(session_id or "").strip(), target_msg_id)
+            if target_msg_id else ""
+        )
+        if not user_id:
+            self.ctx.logger.warning(
+                "reply好感度身份未能精确匹配: session=%s, msg_id=%s; 使用通用提示",
+                session_id, target_msg_id
+            )
         if user_id:
             hint_text = self._build_affection_hint(user_id, for_replyer=True)
         else:
@@ -1544,6 +1748,36 @@ class AffectionPlugin(MaiBotPlugin):
             )
         if not hint_text:
             return {"action": "continue"}
+
+        # 兜底：Planner 未调用 query_affection 时，Replyer 仍能拿到插件内权威数值。
+        # 只有「本轮本人数字查询」和「回复 msg_id 精确对应 QQ 号」同时满足才注入；
+        # 无法确认身份或询问第三人时绝不代入其他群友的分数。
+        key = (str(session_id or "").strip(), target_msg_id)
+        if target_msg_id and key in self._affection_numeric_requests:
+            is_self_query = self._affection_numeric_requests[key]
+            if is_self_query and user_id:
+                # 与 query_affection 一致的数据源；仅在精确定位身份后才读取。
+                record = self._get_user_record(user_id)
+                actual = _get_affection_level_info(float(record.get("affection", 0.0)))
+                hint_text += (
+                    f"\n【本轮好感度数值核实】这位用户对你而言的当前好感度为 "
+                    f"{actual['value']}，等级「{actual['level_name']}」。"
+                    "本数据直接来自插件当前存储值，而非模型猜测。对方如果询问具体数字，"
+                    "必须以此数值为准。不能说查不到、没记录，也不要描述为翻账本或查系统；"
+                    "请像在说自己心里的感觉那样自然表达。"
+                )
+                self.ctx.logger.info("好感度问询直接核实: session=%s, msg_id=%s, user=%s", session_id, target_msg_id, user_id)
+            elif is_self_query:
+                hint_text += (
+                    "\n【具体好感度核实失败】本轮未能核实目标与当前分数。"
+                    "不得猜测数字、等级或声称对方没有记录。你仍清楚自己对人的感受；"
+                    "只是这次不能准确报出量化数值。不要说‘我不知道自己的心意’、"
+                    "‘说不准对你的感觉’、‘账本’、‘系统’或‘翻错页’。"
+                    "不必展开后台原因，也不必每次索爱、吃醋或追问。"
+                    f"本轮表达方向：{self._next_affection_fallback_strategy()}"
+                    "请结合当前对话自行措辞，不要照搬固定台词。"
+                )
+                self.ctx.logger.warning("好感度数值核实身份不足: session=%s, msg_id=%s", session_id, target_msg_id)
 
         modified_tool_calls = self._inject_into_reply_reference(tool_calls, hint_text)
         if modified_tool_calls is tool_calls:
@@ -1593,6 +1827,70 @@ class AffectionPlugin(MaiBotPlugin):
         tc["function"] = func
         modified[reply_idx] = tc
         return modified
+
+    def _next_affection_fallback_strategy(self) -> str:
+        """抽取一条不重复的兜底表达策略，而不是固定台词。
+
+        注意：这是给 Replyer 的写作指引，不直接向 QQ 用户发送句子。
+        """
+        options = [
+            "轻轻卖个关子，表示准确数字稍后再说；语气亲近但不故弄玄虚。",
+            "调侃对方突然考你具体数字，但不报未经核实的分数；保持自然。",
+            "干脆承认这次没法给准确数字，不解释技术原因，不延伸新话题。",
+            "先接住对方的亲昵称呼，再表示精确数字这回先欠着；不索爱。",
+            "像朋友开玩笑一样表示不能乱报数字，留一点小小的悬念。",
+            "用慵懒又俏皮的语气把数字问题暂时放下，不怀疑自己的感受。",
+            "爽快地表示暂时不报未经核实的数字，然后自然回应眼前这句话。",
+        ]
+        if not self._affection_fallback_strategies:
+            self._affection_fallback_strategies = list(options)
+            random.shuffle(self._affection_fallback_strategies)
+            if (
+                self._last_affection_fallback_strategy
+                and len(self._affection_fallback_strategies) > 1
+                and self._affection_fallback_strategies[-1] == self._last_affection_fallback_strategy
+            ):
+                self._affection_fallback_strategies[0], self._affection_fallback_strategies[-1] = (
+                    self._affection_fallback_strategies[-1], self._affection_fallback_strategies[0]
+                )
+        strategy = self._affection_fallback_strategies.pop()
+        self._last_affection_fallback_strategy = strategy
+        return strategy
+
+    @staticmethod
+    def _detect_affection_number_request(message_content: str) -> tuple[bool, bool]:
+        """判断当前用户消息是否明确询问好感度数字，及能否安全视为本人。
+
+        返回 (is_lookup, is_self)。这只是回复可靠性的补充判断；
+        不代替 Planner 对查询其他人的语义判断。
+        """
+        # <message msg_id="..."> 是 MaiBot 的外层包装，避免历史引文混入。
+        content = str(message_content or "")
+        opening_tag = re.search(r"<message\b[^>]*>", content)
+        if opening_tag:
+            content = content[opening_tag.end():]
+            content = re.sub(r"</message>\s*$", "", content)
+        # 不把长篇引用当作当前请求；只看靠前的正文。
+        text = content.strip()[:280]
+        if not re.search(r"好感度|亲密度|好感值", text):
+            return False, False
+        if not re.search(r"多少|几(?:点|分|级)?|数值|分数|等级|查询|查一下|查查|查|看看|看下|报(?:个|一下)?数|现在|目前|想知道|告诉我|想问|有多少", text):
+            return False, False
+        # 有明确第三方 QQ、第三人称或“某某的好感度”时不代入当前发言人。
+        third_party = bool(re.search(
+            r"(?:QQ|qq|用户|账号|号码)\s*[:：#]?\s*\d{5,12}"
+            r"|(?:他|她|别人|其他人|那个人)的好感",
+            text,
+        ))
+        # “托亚的好感度”是第三人，“你对我的好感度”则是本人。
+        for match in re.finditer(r"([\u4e00-\u9fff]{1,12})的(?:好感度|亲密度|好感值)", text):
+            subject = match.group(1)
+            if not subject.endswith(("我", "你", "咱", "我们", "咱们", "本人")):
+                third_party = True
+                break
+        # 省略主语的“好感度是多少呀”通常是在问当前发言者自己；
+        # 不明言第三人时可以查当前发言人，避免无谓的查询失败。
+        return True, not third_party
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -1644,6 +1942,33 @@ class AffectionPlugin(MaiBotPlugin):
             )
         if not hint_text:
             return {"action": "continue"}
+
+        # 从本轮 Prompt 最后一条带 msg_id 的真人消息检测精确好感度问询。
+        # 使用 msg_id 键控，避免同群后来者的问询污染前一条消息的回复。
+        current_msg_id = ""
+        current_msg_body = ""
+        for candidate in reversed(messages):
+            if not isinstance(candidate, dict) or candidate.get("role") != "user" or candidate.get("tool_call_id"):
+                continue
+            body = str(candidate.get("content") or "")
+            mid = self._extract_prompt_message_id(body)
+            if mid:
+                current_msg_id, current_msg_body = mid, body
+                break
+        is_numeric_query, is_self_query = self._detect_affection_number_request(current_msg_body)
+        if current_msg_id and is_numeric_query:
+            key = (str(session_id or "").strip(), current_msg_id)
+            self._affection_numeric_requests[key] = is_self_query
+            if len(self._affection_numeric_requests) > 512:
+                self._affection_numeric_requests.pop(next(iter(self._affection_numeric_requests)))
+            hint_text += (
+                "\n【具体好感度问询】对方正在询问好感度数值或等级。请先调用 query_affection 获取实时数据，"
+                "查询成功后才能报告准确数值。没有实际查询结果不能断言‘没记录’、不能编造分数，"
+                "也不要说自己翻账本、翻档案或翻错页。好感度是你心里的感受，数值只是幕后量化。"
+                "如果本轮确实无法核实准确数字，就暂时不报数字；不要把数值核实失败"
+                "说成自己不确定感情，也不要编造好感度等级。等待 Replyer 侧的多样化兜底指引。"
+            )
+            self.ctx.logger.info("检测到具体好感度问询: session=%s, msg_id=%s, self=%s", session_id, current_msg_id, is_self_query)
 
         # 注入一条 system 提示。若消息中已有 system 消息，则插在最后一个
         # system 之后；否则直接作为首条。这样既不影响原有系统提示，又能
@@ -1706,6 +2031,21 @@ class AffectionPlugin(MaiBotPlugin):
             if anchored_user_id:
                 self._session_user_map[session_id] = anchored_user_id
                 return anchored_user_id
+
+            # Prompt 含真实消息ID但索引未命中，禁止回退到其他群友。
+            for msg in reversed(messages):
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "user" or msg.get("tool_call_id"):
+                    continue
+                mid = self._extract_prompt_message_id(str(msg.get("content") or ""))
+                if mid:
+                    self.ctx.logger.warning(
+                        "Planner好感度身份锚定失败: session=%s, msg_id=%s",
+                        session_id, mid
+                    )
+                    self._session_user_map.pop(session_id, None)
+                    return ""
 
         # 2. 接收索引最近发言人（近似，replyer 等无 prompt 场景）
         latest_user_id = self._lookup_latest_session_speaker(session_id)
@@ -2166,6 +2506,11 @@ class AffectionPlugin(MaiBotPlugin):
             f"属于「{level_info['level_name']}」等级：{level_info['level_description']}。",
             f"回应时应体现：{response_hint}",
         ]
+        lines.append(
+            "好感度代表你内心对这个人的感觉，不是现实中的账本、档案或纸质记录。"
+            "日常聊天自然流露态度，不主动把好感度说成后台系统；"
+            "只有对方明确询问数值时才按真实数据回答。"
+        )
         if record.get("locked", False):
             lines.append("（该用户好感度已被管理员锁定，请保持当前态度，不要试图改变。）")
         elif (

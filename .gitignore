@@ -21,3 +21,18 @@ Thumbs.db
 .pytest_cache/
 dist/
 build/
+
+# Private runtime and maintenance artifacts
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+/affection_data.json
+/impression_data.json
+/impression_data.lock
+/data/
+/backups/
+/production/
+/MAIBOT_CHANGELOG.md
